@@ -151,7 +151,7 @@ class TransformerDecoder(nn.Module):
                 pos_transformation = self.query_scale(output)
 
             # get sine embedding for the query vector
-            query_sine_embed = gen_sineembed_for_position(obj_center)     
+            query_sine_embed = gen_sineembed_for_position(obj_center)
             # apply transformation
             query_sine_embed = query_sine_embed * pos_transformation
             output = layer(output, memory, tgt_mask=tgt_mask,
@@ -286,7 +286,7 @@ class TransformerDecoderLayer(nn.Module):
                      query_pos: Optional[Tensor] = None,
                      query_sine_embed = None,
                      is_first = False):
-                     
+
         # ========== Begin of Self-Attention =============
         # Apply projections here
         # shape: num_queries x batch_size x 256
@@ -321,7 +321,7 @@ class TransformerDecoderLayer(nn.Module):
 
         k_pos = self.ca_kpos_proj(pos)
 
-        # For the first decoder layer, we concatenate the positional embedding predicted from 
+        # For the first decoder layer, we concatenate the positional embedding predicted from
         # the object query (the positional embedding) into the original query (key) in DETR.
         if is_first:
             q_pos = self.ca_qpos_proj(query_pos)
@@ -342,7 +342,7 @@ class TransformerDecoderLayer(nn.Module):
         tgt2 = self.cross_attn(query=q,
                                    key=k,
                                    value=v, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]               
+                                   key_padding_mask=memory_key_padding_mask)[0]
         # ========== End of Cross-Attention =============
 
         tgt = tgt + self.dropout2(tgt2)
