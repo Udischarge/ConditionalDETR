@@ -2,7 +2,7 @@ script_name1=`basename $0`
 script_name=${script_name1:0:${#script_name1}-3}
 
 python -m torch.distributed.launch \
-    --nproc_per_node=8 \
+    --nproc_per_node=1 \
     --use_env \
     main.py \
     --batch_size 1 \
