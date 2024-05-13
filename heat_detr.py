@@ -72,24 +72,23 @@ transform = T.Compose([
 
 
 # 加载线上的模型
-model = torch.hub.load('../ConditionalDETR', 'conditional_detr_resnet50', source='local',pretrained=True)
+model = torch.hub.load('facebookresearch/detr', 'detr_resnet50_dc5', pretrained=True)
 model.eval()
 # 获取训练好的参数
-# for name, parameters in model.named_parameters():
+for name, parameters in model.named_parameters():
     # 获取训练好的object queries，即pq:[100,256]
-    # print(name, parameters.shape)
-    # if name == 'query_embed.weight':
-    #     pq = parameters
-    # # 获取解码器的最后一层的交叉注意力模块中q和k的线性权重和偏置:[256*3,256]，[768]
-    # if name == 'transformer.decoder.layers.5.ca_qcontent_proj.weight':
-    #     ca_qcontent_proj_weight = parameters
-    # if name == 'transformer.decoder.layers.5.ca_qcontent_proj.bias':
-    #     ca_qcontent_proj_bias = parameters
+    if name == 'query_embed.weight':
+        pq = parameters
+    # 获取解码器的最后一层的交叉注意力模块中q和k的线性权重和偏置:[256*3,256]，[768]
+    if name == 'transformer.decoder.layers.5.multihead_attn.in_proj_weight':
+        in_proj_weight = parameters
+    if name == 'transformer.decoder.layers.5.multihead_attn.in_proj_bias':
+        in_proj_bias = parameters
 # 线上下载图像
-# url = 'http://images.cocodataset.org/val2017/000000039769.jpg'
-# im = Image.open(requests.get(url, stream=True).raw)
-img_path = '/workspace/ConditionalDETR/000000039769.jpg'
-im = Image.open(img_path)
+url = 'http://images.cocodataset.org/val2017/000000039769.jpg'
+im = Image.open(requests.get(url, stream=True).raw)
+# img_path = '/home/wujian/000000039769.jpg'
+# im = Image.open(img_path)
 
 # mean-std normalize the input image (batch-size: 1)
 img = transform(im).unsqueeze(0)
@@ -99,8 +98,7 @@ outputs = model(img)
 
 # keep only predictions with 0.7+ confidence
 probas = outputs['pred_logits'].softmax(-1)[0, :, :-1]
-# keep = probas.max(-1).values > 0
-keep = probas.max(-1).values > 0.5
+keep = probas.max(-1).values > 0.9
 
 # convert boxes from [0; 1] to image scales
 bboxes_scaled = rescale_bboxes(outputs['pred_boxes'][0, keep], im.size)
@@ -108,39 +106,34 @@ bboxes_scaled = rescale_bboxes(outputs['pred_boxes'][0, keep], im.size)
 # use lists to store the outputs via up-values
 conv_features, enc_attn_weights, dec_attn_weights = [], [], []
 cq = []     # 存储detr中的 cq
-pq =[]
 pk =  []    # 存储detr中的 encoder pos
-ck =[]
+memory = [] # 存储encoder的输出特征图memory
+
 # 注册hook
 hooks = [
     # 获取resnet最后一层特征图
     model.backbone[-2].register_forward_hook(
         lambda self, input, output: conv_features.append(output)
     ),
+    # 获取encoder的图像特征图memory
+    model.transformer.encoder.register_forward_hook(
+        lambda self, input, output: memory.append(output)
+    ),
     # 获取encoder的最后一层layer的self-attn weights
     model.transformer.encoder.layers[-1].self_attn.register_forward_hook(
         lambda self, input, output: enc_attn_weights.append(output[1])
     ),
     # 获取decoder的最后一层layer中交叉注意力的 weights
-    model.transformer.decoder.layers[-1].cross_attn.register_forward_hook(
+    model.transformer.decoder.layers[-1].multihead_attn.register_forward_hook(
         lambda self, input, output: dec_attn_weights.append(output[1])
     ),
-# ---------------------------------------------------------------------------------#
-    # 获取encoder的图像特征图memory的映射ck
-    model.transformer.decoder.layers[-1].ca_kcontent_proj.register_forward_hook(
-        lambda self, input, output: ck.append(output)
-    ),
-    # 获取decoder最后一层self-attn的输出的映射cq
-    model.transformer.decoder.layers[-1].ca_qcontent_proj.register_forward_hook(
+    # 获取decoder最后一层self-attn的输出cq
+    model.transformer.decoder.layers[-1].norm1.register_forward_hook(
         lambda self, input, output: cq.append(output)
     ),
     # 获取图像特征图的位置编码pk
-    model.transformer.decoder.layers[-1].ca_kpos_proj.register_forward_hook(
+    model.backbone[-1].register_forward_hook(
         lambda self, input, output: pk.append(output)
-    ),
-    # 获取图像特征图的位置编码pq
-    model.transformer.decoder.layers[-1].ca_qpos_sine_proj.register_forward_hook(
-        lambda self, input, output: pq.append(output)
     ),
 ]
 
@@ -155,50 +148,74 @@ for hook in hooks:
 conv_features = conv_features[0]       # [1,2048,25,34]
 enc_attn_weights = enc_attn_weights[0] # [1,850,850]   : [N,L,S]
 dec_attn_weights = dec_attn_weights[0] # [1,100,850]   : [N,L,S] --> [batch, tgt_len, src_len]
+memory = memory[0] # [850,1,256]
 
 cq = cq[0]    # decoder的self_attn:最后一层输出[100,1,256]
-ck = ck[0]
-pq = pq[0]
 pk = pk[0]    # [1,256,25,34]
+
 num_queries = 300
 bs = 1
 n_model = 256
 nhead = 8
-hw = 850
+h, w = conv_features['0'].tensors.shape[-2:]
+hw = h * w
 
-cq = cq.view(num_queries, bs, nhead, n_model//nhead)
-pq = pq.view(num_queries, bs, nhead, n_model//nhead)
-# q = cq.view(num_queries, bs, n_model)
-q = torch.cat([cq, pq], dim=3).view(num_queries, bs, n_model * 2)
-ck = ck.view(hw, bs, nhead, n_model//nhead)
-pk = pk.view(hw, bs, nhead, n_model//nhead) * 0.2
-k = ck.view(hw, bs, n_model)
-k = torch.cat([ck, pk], dim=3).view(hw, bs, n_model * 2)
+# 绘制postion embedding
+pk = pk.flatten(-2).permute(2,0,1)           # [1,256,850] --> [850,1,256]
+pq = pq.unsqueeze(1).repeat(1,1,1)           # [100,1,256]
+q = cq + pq
+# q = cq
+# q = pq
+#------------------------------------------------------#
+#   1) k = pk，则可视化： (cq + oq)*pk
+#   2_ k = pk + memory，则可视化 (cq + oq)*(memory + pk)
+#   读者可自行尝试
+#------------------------------------------------------#
+# k = memory
+# k = pk
+k = pk + memory
 #------------------------------------------------------#
 
+# 将q和k完成线性层的映射，代码参考自nn.MultiHeadAttn()
+_b = in_proj_bias
+_start = 0
+_end = 256
+_w = in_proj_weight[_start:_end, :]
+if _b is not None:
+    _b = _b[_start:_end]
+q = linear(q, _w, _b)
+
+_b = in_proj_bias
+_start = 256
+_end = 256 * 2
+_w = in_proj_weight[_start:_end, :]
+if _b is not None:
+    _b = _b[_start:_end]
+k = linear(k, _w, _b)
 
 scaling = float(256) ** -0.5
-q = q * scaling
-q = q.contiguous().view(300, 8, 64).transpose(0, 1)
-k = k.contiguous().view(-1, 8, 64).transpose(0, 1)
+q = q * scaling * 2
+
+q = q.contiguous().view(100, 8, 32).transpose(0, 1)
+k = k.contiguous().view(-1, 8, 32).transpose(0, 1)
 attn_output_weights = torch.bmm(q, k.transpose(1, 2))
 
-attn_output_weights = attn_output_weights.view(1, 8, 300, 850)
-attn_output_weights = attn_output_weights.view(1 * 8,300, 850)
+attn_output_weights = attn_output_weights.view(1, 8, 100, hw)
+attn_output_weights = attn_output_weights.view(1 * 8, 100, hw)
 attn_output_weights = softmax(attn_output_weights, dim=-1)
-attn_output_weights = attn_output_weights.view(1, 8, 300, 850)
+attn_output_weights = attn_output_weights.view(1, 8, 100, hw)
 
 # 后续可视化各个头
 attn_every_heads = attn_output_weights # [1,8,100,850]
-attn_output_weights = attn_output_weights.sum(dim=1) / 8 # [1,100,850]
+attn_sum_heads = attn_output_weights.sum(dim=1) / 8 # [1,100,850]
 
 #-----------#
 #   可视化
 #-----------#
 # get the feature map shape
-h, w = conv_features['0'].tensors.shape[-2:]
 
-fig, axs = plt.subplots(ncols=len(bboxes_scaled), nrows=10, figsize=(100, 150))  # [11,14]
+
+fig, axs = plt.subplots(ncols=len(bboxes_scaled), nrows=11, figsize=(11, 20))  # [11,14]
 colors = COLORS * 100
 
 # 可视化
@@ -207,20 +224,25 @@ for idx, ax_i, (xmin, ymin, xmax, ymax) in zip(keep.nonzero(), axs.T, bboxes_sca
     ax = ax_i[0]
     ax.imshow(dec_attn_weights[0, idx].view(h, w))
     ax.axis('off')
-    ax.set_title(f'query id: {idx.item()}',fontsize = 10)
+    ax.set_title(f'query id: {idx.item()}',fontsize = 20)
     # 可视化框和类别
     ax = ax_i[1]
     ax.imshow(im)
     ax.add_patch(plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
                                fill=False, color='blue', linewidth=3))
     ax.axis('off')
-    ax.set_title(CLASSES[probas[idx].argmax()],fontsize = 10)
+    ax.set_title(CLASSES[probas[idx].argmax()],fontsize = 20)
     # 分别可视化8个头部的位置特征图
     for head in range(2, 2 + 8):
         ax = ax_i[head]
         ax.imshow(attn_every_heads[0, head-2, idx].view(h,w))
         ax.axis('off')
-        ax.set_title(f'head:{head-2}',fontsize = 10)
+        ax.set_title(f'head:{head-2}',fontsize = 20)
+    ax = ax_i[10]
+    ax.imshow(attn_sum_heads[0, idx].view(h,w))
+    ax.axis('off')
+    ax.set_title(f'sum_head',fontsize = 20)
+
 fig.tight_layout()        # 自动调整子图来使其填充整个画布
 plt.show()
 # 保存图片
